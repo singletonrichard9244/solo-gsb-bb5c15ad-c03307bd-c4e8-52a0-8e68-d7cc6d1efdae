@@ -134,6 +134,19 @@ CREATE TABLE IF NOT EXISTS import_prechecks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_prechecks_roll ON import_prechecks (roll_no);
+
+-- 扫描瑕疵复核：按批次**原始帧列表**的 0 起算位置登记瑕疵（模糊、划痕、曝光异常）。
+-- 每个位置至多一条标记；PUT 接口整体替换（先全删再插）。批次撤销时在同一写事务内
+-- 显式清理（外键 ON DELETE CASCADE 兜底）；瑕疵队列只按存活批次实时重算。
+-- 旧批次没有 raw_frames_json，不允许登记（PUT 返回 409），其去重帧在队列中视为
+-- 未标记扫描出现。
+CREATE TABLE IF NOT EXISTS batch_defects (
+    batch_id    TEXT NOT NULL,
+    position    INTEGER NOT NULL CHECK (position >= 0),
+    defect_type TEXT NOT NULL CHECK (defect_type IN ('模糊', '划痕', '曝光异常')),
+    PRIMARY KEY (batch_id, position),
+    FOREIGN KEY (batch_id) REFERENCES batches (id) ON DELETE CASCADE
+);
 """
 
 

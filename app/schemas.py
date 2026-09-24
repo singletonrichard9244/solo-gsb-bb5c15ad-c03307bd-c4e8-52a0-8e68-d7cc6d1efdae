@@ -1,11 +1,14 @@
 """Pydantic 请求/响应模型。"""
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 PositiveInt = Annotated[int, Field(ge=1)]
+
+# 对外稳定的瑕疵类型枚举（中文契约）
+DefectType = Literal["模糊", "划痕", "曝光异常"]
 
 
 class BatchIn(BaseModel):
@@ -143,6 +146,70 @@ class BatchQualityOut(BaseModel):
         ..., description="本次评估使用的告警阈值"
     )
     created_at: str = Field(..., description="批次导入时间（UTC ISO-8601）")
+
+
+# ---------- 扫描瑕疵复核 ----------
+
+class DefectIn(BaseModel):
+    position: int = Field(
+        ...,
+        ge=0,
+        description="瑕疵帧在该批**原始帧列表**中的位置（0 起算）",
+    )
+    defect_type: DefectType = Field(
+        ..., description="瑕疵类型：模糊 / 划痕 / 曝光异常"
+    )
+
+
+class BatchDefectsIn(BaseModel):
+    defects: list[DefectIn] = Field(
+        ..., description="该批全部瑕疵标记，按位置 0 起算；PUT 整体替换（含清空）"
+    )
+
+    @field_validator("defects")
+    @classmethod
+    def _no_duplicate_positions(cls, v: list[DefectIn]) -> list[DefectIn]:
+        seen: set[int] = set()
+        for item in v:
+            if item.position in seen:
+                raise ValueError("position 不能重复")
+            seen.add(item.position)
+        return v
+
+
+class DefectOut(BaseModel):
+    position: int = Field(..., description="在该批原始帧列表中的位置（0 起算）")
+    frame_no: int = Field(..., description="该位置对应的扫描帧号")
+    defect_type: DefectType
+
+
+class BatchDefectsOut(BaseModel):
+    batch_id: str
+    roll_no: str
+    frame_count: int = Field(
+        ..., description="该批原始帧列表长度（合法位置为 0 … frame_count−1）"
+    )
+    defects: list[DefectOut] = Field(
+        ..., description="当前生效的全部瑕疵标记，按位置升序"
+    )
+
+
+class DefectQueueItem(BaseModel):
+    frame_no: int = Field(..., description="入队帧号")
+    defect_occurrence_count: int = Field(
+        ...,
+        description="瑕疵出现次数：该帧在当前胶卷存活批次原始列表中的总出现次数"
+        "（入队即全部出现均已被标记瑕疵，故此计数等于已标记出现次数）",
+    )
+
+
+class DefectQueueOut(BaseModel):
+    roll_no: str
+    frames: list[DefectQueueItem] = Field(
+        ...,
+        description="所有有效扫描出现均被标记瑕疵的帧，按帧号升序；"
+        "同帧任一未标记出现（未提交瑕疵的批次、旧批次去重帧）即不入队",
+    )
 
 
 class RollState(BaseModel):
