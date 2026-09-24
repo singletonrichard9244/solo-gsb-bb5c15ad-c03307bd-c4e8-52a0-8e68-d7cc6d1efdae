@@ -134,6 +134,18 @@ CREATE TABLE IF NOT EXISTS import_prechecks (
 );
 
 CREATE INDEX IF NOT EXISTS idx_prechecks_roll ON import_prechecks (roll_no);
+
+-- 扫描瑕疵标记：按批次原始帧列表中 0 起算的位置记录瑕疵类型（模糊/划痕/曝光异常）。
+-- 每批每位置至多一条；PUT 整体替换（同事务先清后写）；批次撤销时随批次清理
+-- （见 services.delete_batch），瑕疵队列只按存活批次实时重算。
+CREATE TABLE IF NOT EXISTS batch_defects (
+    batch_id    TEXT NOT NULL,
+    position    INTEGER NOT NULL,
+    defect_type TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (batch_id, position),
+    FOREIGN KEY (batch_id) REFERENCES batches (id)
+);
 """
 
 
@@ -143,6 +155,7 @@ def init_db() -> None:
     旧版库（没有 raw_frames_json 列）通过 ALTER TABLE 平滑升级；
     旧批次该列为 NULL，撤销时据此判定能否安全重建（详见 services.delete_batch）。
     旧版 rescan_claims 没有 completed_at 列，同样幂等补齐（补扫回执结案标记）。
+    瑕疵标记表 batch_defects 由上方 SCHEMA 幂等建表，旧库启动时自动补建。
     """
     conn = _connect()
     try:

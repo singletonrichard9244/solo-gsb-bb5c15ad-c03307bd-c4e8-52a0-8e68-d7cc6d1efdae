@@ -685,6 +685,8 @@ def delete_batch(conn: sqlite3.Connection, batch_id: str) -> None:
       （批内重复保留；跨批重复按重建后的前缀集合重算）。
     - 若剩余批次中存在旧版数据（raw_frames_json 为 NULL，无法区分批内与
       跨批重复），抛 LegacyBatchDataError（接口返回 409）且不改变任何数据。
+    - 被撤销批次的瑕疵标记（batch_defects）在同一事务内一并清理，
+      瑕疵复核队列只按存活批次实时重算。
     - 最后一批撤销后胶卷视为不存在：清空其预期范围与帧，并把该胶卷全部
       未释放的历史认领标记为已释放，使其不阻碍同编号胶卷重新导入后的领取。
     """
@@ -714,6 +716,8 @@ def delete_batch(conn: sqlite3.Connection, batch_id: str) -> None:
         conn.execute(
             "DELETE FROM roll_frames WHERE roll_no = ?", (roll_no,)
         )
+        # 清理被撤销批次的瑕疵标记（须在删批次行前，外键约束）；剩余批次标记保留
+        conn.execute("DELETE FROM batch_defects WHERE batch_id = ?", (batch_id,))
         conn.execute("DELETE FROM batches WHERE id = ?", (batch_id,))
         conn.execute(
             "DELETE FROM roll_expected WHERE roll_no = ?", (roll_no,)
@@ -1426,3 +1430,139 @@ def frame_provenance(
         frames=items,
         next_cursor=page_frames[-1] if has_more and page_frames else None,
     )
+
+
+# ---------- 扫描瑕疵复核 ----------
+
+class DefectPositionError(Exception):
+    """瑕疵标记位置非法：同一位置重复提交，或位置超出原始帧列表长度。"""
+
+
+def put_batch_defects(
+    conn: sqlite3.Connection, batch_id: str, data: schemas.BatchDefectsIn
+) -> schemas.BatchDefectsOut:
+    """整体替换一个批次的瑕疵标记（PUT 语义：同一写事务内先清后写）。
+
+    位置为该批**原始帧列表**（含批内重复、保序）中 0 起算的下标，每个位置
+    至多一条标记；提交空列表即清除该批全部标记。校验规则：
+
+    - 批次不存在 → BatchNotFoundError（接口 404）；
+    - 旧版批次缺少原始帧列表 → LegacyBatchDataError（接口 409），无法按位置标记；
+    - 位置重复或越界（≥ 原始列表长度）→ DefectPositionError（接口 422），数据不变。
+    """
+    now = _now_iso()
+
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        r = conn.execute(
+            "SELECT id, roll_no, raw_frames_json FROM batches WHERE id = ?",
+            (batch_id,),
+        ).fetchone()
+        if r is None:
+            raise BatchNotFoundError(batch_id)
+        if r["raw_frames_json"] is None:
+            # 旧版批次只保存去重后的帧集合，没有 0 起算位置可标记
+            raise LegacyBatchDataError([r["id"]])
+        raw_frames: list[int] = json.loads(r["raw_frames_json"])
+
+        positions = [d.position for d in data.defects]
+        duplicated = sorted(_within_batch_duplicates(positions))
+        if duplicated:
+            raise DefectPositionError(
+                "瑕疵位置重复: " + ", ".join(map(str, duplicated))
+            )
+        out_of_range = sorted(p for p in positions if p >= len(raw_frames))
+        if out_of_range:
+            raise DefectPositionError(
+                f"瑕疵位置越界（原始帧列表长度 {len(raw_frames)}，"
+                f"合法位置 0–{len(raw_frames) - 1}）: "
+                + ", ".join(map(str, out_of_range))
+            )
+
+        conn.execute("DELETE FROM batch_defects WHERE batch_id = ?", (batch_id,))
+        conn.executemany(
+            """INSERT INTO batch_defects (batch_id, position, defect_type, updated_at)
+               VALUES (?, ?, ?, ?)""",
+            [(batch_id, d.position, d.defect_type, now) for d in data.defects],
+        )
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    marks = sorted(data.defects, key=lambda d: d.position)
+    return schemas.BatchDefectsOut(
+        batch_id=r["id"],
+        roll_no=r["roll_no"],
+        defects=[
+            schemas.DefectMarkOut(
+                position=d.position,
+                frame_no=raw_frames[d.position],
+                defect_type=d.defect_type,
+            )
+            for d in marks
+        ],
+        updated_at=now,
+    )
+
+
+def get_defect_queue(
+    conn: sqlite3.Connection, roll_no: str
+) -> schemas.DefectQueueOut:
+    """胶卷瑕疵复核队列：全部有效扫描出现均被标记瑕疵的帧，按帧号升序。
+
+    实时按**存活批次**重算（只读事务内一致性读取）：
+
+    - 一次“扫描出现”= 某批原始帧列表中的一项（批内重复各算一次）；
+      旧版批次没有原始列表，其去重帧各计 1 次**未标记**出现；
+    - 未提交过瑕疵标记的批次，其全部出现视为未标记；
+    - 同一帧只要存在任一未标记出现即不入队；全部出现均被标记才入队，
+      此时 ``defect_occurrences`` 即被标记的出现次数（等于有效出现总次数）；
+    - 批次撤销时其瑕疵标记已随批次清理（见 delete_batch），此处自然只统计存活批次。
+
+    胶卷不存在（无任何存活批次）→ RollNotFoundError（接口 404）。
+    """
+    conn.execute("BEGIN")
+    try:
+        if not _roll_exists(conn, roll_no):
+            raise RollNotFoundError(roll_no)
+        batch_rows = conn.execute(
+            """SELECT id, raw_frames_json, frames_json
+                 FROM batches
+                WHERE roll_no = ?
+                ORDER BY created_at, rowid""",
+            (roll_no,),
+        ).fetchall()
+        marked_rows = conn.execute(
+            """SELECT batch_id, position FROM batch_defects
+                WHERE batch_id IN (SELECT id FROM batches WHERE roll_no = ?)""",
+            (roll_no,),
+        ).fetchall()
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+
+    marked = {(r["batch_id"], r["position"]) for r in marked_rows}
+    total: dict[int, int] = {}          # 帧 -> 有效扫描出现总次数
+    marked_count: dict[int, int] = {}   # 帧 -> 被标记瑕疵的出现次数
+    for br in batch_rows:
+        raw_json = br["raw_frames_json"]
+        if raw_json is not None:
+            for pos, f in enumerate(json.loads(raw_json)):
+                total[f] = total.get(f, 0) + 1
+                if (br["id"], pos) in marked:
+                    marked_count[f] = marked_count.get(f, 0) + 1
+        else:
+            # 旧版批次：去重帧各计 1 次未标记出现（旧批次不可标记，PUT 返回 409）
+            for f in json.loads(br["frames_json"]):
+                total[f] = total.get(f, 0) + 1
+
+    items = [
+        schemas.DefectQueueItem(
+            frame_no=f, defect_occurrences=marked_count.get(f, 0)
+        )
+        for f in sorted(total)
+        if marked_count.get(f, 0) == total[f]
+    ]
+    return schemas.DefectQueueOut(roll_no=roll_no, items=items)

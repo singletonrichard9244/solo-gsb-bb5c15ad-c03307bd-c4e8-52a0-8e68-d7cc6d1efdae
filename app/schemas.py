@@ -1,7 +1,7 @@
 """Pydantic 请求/响应模型。"""
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -212,6 +212,59 @@ class FrameProvenanceOut(BaseModel):
 class HealthOut(BaseModel):
     status: str
     db: str
+
+
+# ---------- 扫描瑕疵复核 ----------
+
+# 瑕疵类型（对外契约，稳定取值，勿随意改动）
+DefectType = Literal["模糊", "划痕", "曝光异常"]
+
+
+class DefectMarkIn(BaseModel):
+    position: int = Field(
+        ..., ge=0, description="批次原始帧列表中的位置（0 起算，非负整数）"
+    )
+    defect_type: DefectType = Field(
+        ..., description="瑕疵类型：模糊 / 划痕 / 曝光异常"
+    )
+
+
+class BatchDefectsIn(BaseModel):
+    defects: list[DefectMarkIn] = Field(
+        ...,
+        description="整批瑕疵标记，整体替换该批现有标记；空列表表示清除该批全部标记",
+    )
+
+
+class DefectMarkOut(BaseModel):
+    position: int = Field(..., description="批次原始帧列表中的位置（0 起算）")
+    frame_no: int = Field(..., description="该位置上的帧号")
+    defect_type: DefectType = Field(..., description="瑕疵类型：模糊 / 划痕 / 曝光异常")
+
+
+class BatchDefectsOut(BaseModel):
+    batch_id: str
+    roll_no: str
+    defects: list[DefectMarkOut] = Field(
+        ..., description="本次替换后生效的全部瑕疵标记（按位置升序）"
+    )
+    updated_at: str = Field(..., description="本次替换时间（UTC ISO-8601）")
+
+
+class DefectQueueItem(BaseModel):
+    frame_no: int = Field(
+        ..., description="全部有效扫描出现均被标记瑕疵的帧号"
+    )
+    defect_occurrences: int = Field(
+        ..., description="该帧被标记瑕疵的扫描出现次数（入队时等于其有效出现总次数）"
+    )
+
+
+class DefectQueueOut(BaseModel):
+    roll_no: str
+    items: list[DefectQueueItem] = Field(
+        ..., description="待复核帧列表，按帧号升序；空列表表示当前无全瑕疵帧"
+    )
 
 
 class RescanClaimIn(BaseModel):

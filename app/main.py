@@ -20,8 +20,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="胶片档案扫描整理 API",
-    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）；支持批次导入预检（持久化预检单、状态指纹复核后确认导入）。",
-    version="1.7.0",
+    description="按胶卷汇总扫描帧、去重、统计预期范围内的连续缺帧；批次导入幂等；支持误导入批次撤销、补扫任务认领与补扫完成回执；支持交付快照及相对快照的区间级差异对比；支持单批次采集质量审查（批内重复率、越界帧、预期内缺口及稳定告警代码）；支持批次导入预检（持久化预检单、状态指纹复核后确认导入）；支持扫描瑕疵复核（按批标记原始列表位置的瑕疵类型，胶卷级瑕疵复核队列）。",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -161,6 +161,39 @@ def get_batch_quality(batch_id: str, conn: Connection = Depends(database.get_db)
         )
 
 
+@app.put(
+    "/batches/{batch_id}/defects",
+    response_model=schemas.BatchDefectsOut,
+    tags=["瑕疵复核"],
+)
+def put_batch_defects(
+    batch_id: str,
+    payload: schemas.BatchDefectsIn,
+    conn: Connection = Depends(database.get_db),
+):
+    """提交并**整体替换**一个批次的瑕疵标记（同一写事务内先清后写）。
+
+    每条标记给出该批**原始帧列表**（含批内重复、保序）中 0 起算的 ``position``
+    及瑕疵类型（``模糊`` / ``划痕`` / ``曝光异常``）；提交空列表即清除该批全部
+    标记。位置越界（≥ 原始列表长度）或同一位置重复提交返回 422；批次不存在
+    返回 404；旧版批次缺少原始帧列表返回 409。
+    """
+    try:
+        return services.put_batch_defects(conn, batch_id.strip(), payload)
+    except services.BatchNotFoundError:
+        raise HTTPException(status_code=404, detail="批次不存在")
+    except services.LegacyBatchDataError as e:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "该批次为旧版数据，缺少原始帧列表，无法按 0 起算位置标记瑕疵"
+                f"（相关批次：{', '.join(e.legacy_batch_ids)}）。"
+            ),
+        )
+    except services.DefectPositionError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+
 @app.delete(
     "/batches/{batch_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -238,6 +271,26 @@ def get_frame_provenance(
         raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
     except services.ProvenanceRangeError:
         raise HTTPException(status_code=422, detail="end 不能小于 start")
+
+
+@app.get(
+    "/rolls/{roll_no}/defect-queue",
+    response_model=schemas.DefectQueueOut,
+    tags=["瑕疵复核"],
+)
+def get_defect_queue(roll_no: str, conn: Connection = Depends(database.get_db)):
+    """胶卷瑕疵复核队列：全部有效扫描出现均被标记瑕疵的帧，按帧号升序。
+
+    一次“扫描出现”指某存活批次原始帧列表中的一项（批内重复各算一次）；
+    未提交过瑕疵的批次、旧版批次的去重帧均计为未标记出现。同一帧只要存在
+    任一未标记出现即不入队；全部出现均被标记才入队并给出瑕疵出现次数。
+    撤销批次后其标记即时清理，队列只按存活批次实时重算。
+    胶卷不存在（尚未导入任何批次）返回 404。
+    """
+    try:
+        return services.get_defect_queue(conn, roll_no.strip())
+    except services.RollNotFoundError:
+        raise HTTPException(status_code=404, detail="胶卷不存在（尚未导入任何批次）")
 
 
 @app.post(
